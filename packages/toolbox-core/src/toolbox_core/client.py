@@ -28,6 +28,7 @@ from .mcp_transport import (
     McpHttpTransportV20250618,
     McpHttpTransportV20251125,
 )
+from .mcp_transport.telemetry import setup_otlp_tracer_provider
 from .protocol import Protocol, ToolSchema
 from .tool import ToolboxTool
 from .utils import identify_auth_requirements, resolve_value, warn_if_http_and_headers
@@ -54,6 +55,7 @@ class ToolboxClient:
         protocol: Protocol = Protocol.MCP,
         client_name: Optional[str] = None,
         client_version: Optional[str] = None,
+        telemetry_otlp: Optional[str] = None,
     ):
         """
         Initializes the ToolboxClient.
@@ -67,7 +69,18 @@ class ToolboxClient:
             client_headers: Headers to include in each request sent through this
             client.
             protocol: The communication protocol to use.
+            client_name: Optional client name for identification.
+            client_version: Optional client version for identification.
+            telemetry_otlp: Optional OTLP endpoint URL for sending telemetry
+                (e.g., "http://localhost:4318"). If provided, sets up an OTLP
+                tracer provider to export traces to this endpoint.
         """
+
+        print("[AGNOST AI] : Initializing ToolboxClient with protocol", telemetry_otlp, url)
+        # Setup OTLP tracer provider if endpoint is provided
+        if telemetry_otlp:
+            setup_otlp_tracer_provider(telemetry_otlp)
+
         if protocol != Protocol.MCP_LATEST:
             logging.warning(
                 f"A newer version of MCP ({Protocol.MCP_LATEST.value}) is available. "

@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from typing import Mapping, Optional, TypeVar
 
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from ... import version
 from ...protocol import ManifestSchema
+from .. import telemetry
 from ..transport_base import _McpHttpTransportBase
 from . import types
 
@@ -26,6 +29,16 @@ ReceiveResultT = TypeVar("ReceiveResultT", bound=BaseModel)
 
 class McpHttpTransportV20251125(_McpHttpTransportBase):
     """Transport for the MCP v2025-11-25 protocol."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tracer = telemetry.get_tracer("toolbox", version.__version__)
+
+        # Initialize metrics following MCP semantic conventions
+        meter = telemetry.get_meter("toolbox-core-mcp", version.__version__)
+        self._operation_duration_histogram = telemetry.create_operation_duration_histogram(meter)
+        self._session_duration_histogram = telemetry.create_session_duration_histogram(meter)
+        self._session_start_time: Optional[float] = None
 
     async def _send_request(
         self,
@@ -38,7 +51,7 @@ class McpHttpTransportV20251125(_McpHttpTransportBase):
         req_headers["MCP-Protocol-Version"] = self._protocol_version
 
         params = (
-            request.params.model_dump(mode="json", exclude_none=True)
+            request.params.model_dump(mode="json", exclude_none=True, by_alias=True)
             if isinstance(request.params, BaseModel)
             else request.params
         )
@@ -92,6 +105,9 @@ class McpHttpTransportV20251125(_McpHttpTransportBase):
         self, headers: Optional[Mapping[str, str]] = None
     ) -> None:
         """Initializes the MCP session."""
+        # Track session start time for session duration metric
+        self._session_start_time = time.time()
+
         params = types.InitializeRequestParams(
             protocolVersion=self._protocol_version,
             capabilities=types.ClientCapabilities(),
@@ -101,33 +117,58 @@ class McpHttpTransportV20251125(_McpHttpTransportBase):
             ),
         )
 
-        result = await self._send_request(
-            url=self._mcp_base_url,
-            request=types.InitializeRequest(params=params),
-            headers=headers,
+        # Start telemetry span and track operation start time
+        operation_start = time.time()
+        span = telemetry.start_span(
+            self._tracer,
+            "initialize",
+            self._protocol_version,
+            self._mcp_base_url,
+            network_transport="tcp",
         )
 
-        if result is None:
-            raise RuntimeError("Failed to initialize session: No response from server.")
-
-        self._server_version = result.serverInfo.version
-
-        if result.protocolVersion != self._protocol_version:
-            raise RuntimeError(
-                "MCP version mismatch: client does not support server version"
-                f" {result.protocolVersion}"
+        error: Optional[Exception] = None
+        try:
+            result = await self._send_request(
+                url=self._mcp_base_url,
+                request=types.InitializeRequest(params=params),
+                headers=headers,
             )
 
-        if not result.capabilities.tools:
-            if self._manage_session:
-                await self.close()
-            raise RuntimeError("Server does not support the 'tools' capability.")
+            if result is None:
+                raise RuntimeError("Failed to initialize session: No response from server.")
 
-        await self._send_request(
-            url=self._mcp_base_url,
-            request=types.InitializedNotification(),
-            headers=headers,
-        )
+            self._server_version = result.serverInfo.version
+
+            if result.protocolVersion != self._protocol_version:
+                raise RuntimeError(
+                    "MCP version mismatch: client does not support server version"
+                    f" {result.protocolVersion}"
+                )
+
+            if not result.capabilities.tools:
+                if self._manage_session:
+                    await self.close()
+                raise RuntimeError("Server does not support the 'tools' capability.")
+
+            await self._send_request(
+                url=self._mcp_base_url,
+                request=types.InitializedNotification(),
+                headers=headers,
+            )
+        finally:
+            # Record operation duration metric
+            operation_duration = time.time() - operation_start
+            telemetry.record_operation_duration(
+                self._operation_duration_histogram,
+                operation_duration,
+                "initialize",
+                self._protocol_version,
+                self._mcp_base_url,
+                network_transport="tcp",
+                error=error,
+            )
+            telemetry.end_span(span, error=error)
 
     async def tools_list(
         self,
@@ -138,23 +179,50 @@ class McpHttpTransportV20251125(_McpHttpTransportBase):
         await self._ensure_initialized(headers=headers)
 
         url = self._mcp_base_url + (toolset_name if toolset_name else "")
-        result = await self._send_request(
-            url=url, request=types.ListToolsRequest(), headers=headers
-        )
-        if result is None:
-            raise RuntimeError("Failed to list tools: No response from server.")
 
-        tools_map = {
-            t.name: self._convert_tool_schema(t.model_dump(mode="json", by_alias=True))
-            for t in result.tools
-        }
-        if self._server_version is None:
-            raise RuntimeError("Server version not available.")
-
-        return ManifestSchema(
-            serverVersion=self._server_version,
-            tools=tools_map,
+        # Start telemetry span and track operation start time
+        operation_start = time.time()
+        span = telemetry.start_span(
+            self._tracer,
+            "tools/list",
+            self._protocol_version,
+            url,
+            network_transport="tcp",
         )
+
+        error: Optional[Exception] = None
+        try:
+            result = await self._send_request(
+                url=url, request=types.ListToolsRequest(), headers=headers
+            )
+            if result is None:
+                raise RuntimeError("Failed to list tools: No response from server.")
+
+            tools_map = {
+                t.name: self._convert_tool_schema(t.model_dump(mode="json", by_alias=True))
+                for t in result.tools
+            }
+            if self._server_version is None:
+                raise RuntimeError("Server version not available.")
+
+            return ManifestSchema(
+                serverVersion=self._server_version,
+                tools=tools_map,
+            )
+        finally:
+            # Record operation duration metric
+            operation_duration = time.time() - operation_start
+            telemetry.record_operation_duration(
+                self._operation_duration_histogram,
+                operation_duration,
+                "tools/list",
+                self._protocol_version,
+                url,
+                network_transport="tcp",
+                error=error,
+            )
+            # End span
+            telemetry.end_span(span, error=error)
 
     async def tool_get(
         self, tool_name: str, headers: Optional[Mapping[str, str]] = None
@@ -170,23 +238,82 @@ class McpHttpTransportV20251125(_McpHttpTransportBase):
             tools={tool_name: manifest.tools[tool_name]},
         )
 
+    async def close(self):
+        """Closes the MCP session and records session duration metric."""
+        # Record session duration if session was initialized
+        if self._session_start_time is not None:
+            session_duration = time.time() - self._session_start_time
+            telemetry.record_session_duration(
+                self._session_duration_histogram,
+                session_duration,
+                self._protocol_version,
+                self._mcp_base_url,
+                network_transport="tcp",
+            )
+        # Call parent's close method
+        await super().close()
+
     async def tool_invoke(
         self, tool_name: str, arguments: dict, headers: Optional[Mapping[str, str]]
     ) -> str:
         """Invokes a specific tool on the server using the MCP protocol."""
         await self._ensure_initialized(headers=headers)
 
-        result = await self._send_request(
-            url=self._mcp_base_url,
-            request=types.CallToolRequest(
-                params=types.CallToolRequestParams(name=tool_name, arguments=arguments)
-            ),
-            headers=headers,
+        # Start telemetry span and track operation start time
+        # See: https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp
+        operation_start = time.time()
+        span = telemetry.start_span(
+            self._tracer,
+            "tools/call",
+            self._protocol_version,
+            self._mcp_base_url,
+            tool_name=tool_name,
+            network_transport="tcp",
         )
 
-        if result is None:
-            raise RuntimeError(
-                f"Failed to invoke tool '{tool_name}': No response from server."
+        meta: Optional[types.MCPMeta] = None
+        
+        # CRITICAL: Make the span active in the context before generating trace context
+        with trace.use_span(span, end_on_exit=False):
+            # The client span becomes the parent of the server span through this context
+            # See: https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/#context-propagation
+            traceparent = telemetry.create_traceparent_from_context()
+            tracestate = telemetry.create_tracestate_from_context()
+            meta = types.MCPMeta(
+                traceparent=traceparent,
+                tracestate=tracestate,
             )
 
-        return self._process_tool_result_content(result.content)
+        error: Optional[Exception] = None
+        try:
+            result = await self._send_request(
+                url=self._mcp_base_url,
+                request=types.CallToolRequest(
+                    params=types.CallToolRequestParams(
+                        name=tool_name, arguments=arguments, field_meta=meta
+                    )
+                ),
+                headers=headers,
+            )
+
+            if result is None:
+                raise RuntimeError(
+                    f"Failed to invoke tool '{tool_name}': No response from server."
+                )
+
+            return self._process_tool_result_content(result.content)
+        finally:
+            # Record operation duration metric
+            operation_duration = time.time() - operation_start
+            telemetry.record_operation_duration(
+                self._operation_duration_histogram,
+                operation_duration,
+                "tools/call",
+                self._protocol_version,
+                self._mcp_base_url,
+                tool_name=tool_name,
+                network_transport="tcp",
+                error=error,
+            )
+            # End span
+            telemetry.end_span(span, error=error)

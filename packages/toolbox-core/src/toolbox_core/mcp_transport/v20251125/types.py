@@ -147,9 +147,19 @@ class ListToolsRequest(MCPRequest[ListToolsResult]):
         return ListToolsResult
 
 
+class MCPMeta(_BaseMCPModel):
+    """Metadata for MCP requests including OpenTelemetry trace context."""
+
+    traceparent: str | None = None
+    tracestate: str | None = None
+
+
 class CallToolRequestParams(_BaseMCPModel):
     name: str
     arguments: dict[str, Any]
+    # OpenTelemetry trace context propagation
+    # See: https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/#context-propagation
+    field_meta: MCPMeta | None = Field(default=None, serialization_alias="_meta")
 
 
 class CallToolRequest(MCPRequest[CallToolResult]):
